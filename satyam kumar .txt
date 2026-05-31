@@ -1,0 +1,533 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// OODA Loop Car Racing Game
+// Observe → Orient → Decide → Act
+
+const TRACK_WIDTH = 360;
+const TRACK_HEIGHT = 580;
+const CAR_W = 28;
+const CAR_H = 44;
+const LANE_COUNT = 4;
+const LANE_W = TRACK_WIDTH / LANE_COUNT;
+
+const COLORS = {
+  bg: "#0a0a0f",
+  track: "#1a1a2e",
+  lane: "#16213e",
+  divider: "#0f3460",
+  playerCar: "#e94560",
+  playerGlow: "#ff6b6b",
+  enemyCar: ["#f5a623", "#50fa7b", "#bd93f9", "#8be9fd"],
+  enemyGlow: ["#ffb347", "#69ff97", "#d0aaff", "#a8eeff"],
+  text: "#f8f8f2",
+  accent: "#e94560",
+  road: "#222233",
+  stripe: "#ffb86c",
+  hud: "#282a36",
+};
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function CarSVG({ color, glow, flipped = false }) {
+  return (
+    <svg width={CAR_W} height={CAR_H} viewBox="0 0 28 44" style={{ filter: `drop-shadow(0 0 8px ${glow})`, transform: flipped ? "rotate(180deg)" : undefined }}>
+      <rect x="6" y="2" width="16" height="40" rx="6" fill={color} />
+      <rect x="8" y="6" width="12" height="16" rx="3" fill="rgba(255,255,255,0.2)" />
+      <rect x="4" y="10" width="4" height="10" rx="2" fill={color} opacity="0.8" />
+      <rect x="20" y="10" width="4" height="10" rx="2" fill={color} opacity="0.8" />
+      <rect x="4" y="30" width="4" height="10" rx="2" fill={color} opacity="0.8" />
+      <rect x="20" y="30" width="4" height="10" rx="2" fill={color} opacity="0.8" />
+      <circle cx="14" cy="38" r="3" fill="rgba(255,255,255,0.4)" />
+      <circle cx="9" cy="38" r="2" fill="rgba(255,255,255,0.3)" />
+      <circle cx="19" cy="38" r="2" fill="rgba(255,255,255,0.3)" />
+    </svg>
+  );
+}
+
+function Explosion({ x, y }) {
+  return (
+    <div style={{
+      position: "absolute", left: x - 20, top: y - 20,
+      width: 40, height: 40, borderRadius: "50%",
+      background: "radial-gradient(circle, #fff 0%, #ffb347 40%, #e94560 70%, transparent 100%)",
+      animation: "explode 0.4s ease-out forwards",
+      pointerEvents: "none", zIndex: 20,
+    }} />
+  );
+}
+
+const OODA_PHASES = ["OBSERVE", "ORIENT", "DECIDE", "ACT"];
+const OODA_DESC = [
+  "Scan the road ahead 👁",
+  "Assess threats & gaps 🧭",
+  "Pick your path 🎯",
+  "Move now! ⚡",
+];
+const OODA_COLORS = ["#8be9fd", "#50fa7b", "#ffb86c", "#e94560"];
+
+export default function OODARacing() {
+  const [gameState, setGameState] = useState("menu"); // menu | ooda | playing | dead | win
+  const [oodaStep, setOodaStep] = useState(0);
+  const [playerLane, setPlayerLane] = useState(1);
+  const [targetLane, setTargetLane] = useState(1);
+  const [enemies, setEnemies] = useState([]);
+  const [stripes, setStripes] = useState([]);
+  const [score, setScore] = useState(0);
+  const [level, setLevel] = useState(1);
+  const [speed, setSpeed] = useState(3);
+  const [explosions, setExplosions] = useState([]);
+  const [shake, setShake] = useState(false);
+  const [highScore, setHighScore] = useState(() => parseInt(localStorage.getItem("ooda_hs") || "0"));
+  const [oodaPhaseAnim, setOodaPhaseAnim] = useState(false);
+  const [currentOoda, setCurrentOoda] = useState(0);
+
+  const frameRef = useRef(null);
+  const scoreRef = useRef(0);
+  const enemiesRef = useRef([]);
+  const playerLaneRef = useRef(1);
+  const speedRef = useRef(3);
+  const levelRef = useRef(1);
+  const spawnTimer = useRef(0);
+  const oodaTimer = useRef(0);
+
+  const playerX = playerLane * LANE_W + LANE_W / 2 - CAR_W / 2;
+  const playerY = TRACK_HEIGHT - CAR_H - 20;
+
+  // Smooth lane transition
+  const playerXAnim = useRef(playerX);
+  const [displayX, setDisplayX] = useState(playerX);
+
+  useEffect(() => {
+    playerLaneRef.current = playerLane;
+  }, [playerLane]);
+
+  // Initialize road stripes
+  useEffect(() => {
+    const s = [];
+    for (let i = 0; i < 12; i++) {
+      s.push({ y: (i * 55) % TRACK_HEIGHT, lane: Math.floor(Math.random() * LANE_COUNT) });
+    }
+    setStripes(s);
+  }, []);
+
+  const spawnEnemy = useCallback(() => {
+    const lane = Math.floor(Math.random() * LANE_COUNT);
+    const colorIdx = Math.floor(Math.random() * COLORS.enemyCar.length);
+    return {
+      id: Date.now() + Math.random(),
+      lane,
+      y: -CAR_H - Math.random() * 40,
+      colorIdx,
+      speed: speedRef.current * (0.7 + Math.random() * 0.6),
+    };
+  }, []);
+
+  const triggerExplosion = (x, y) => {
+    const id = Date.now();
+    setExplosions(prev => [...prev, { id, x, y }]);
+    setTimeout(() => setExplosions(prev => prev.filter(e => e.id !== id)), 500);
+  };
+
+  // OODA cycling
+  useEffect(() => {
+    if (gameState !== "playing") return;
+    const interval = setInterval(() => {
+      setCurrentOoda(prev => (prev + 1) % 4);
+      setOodaPhaseAnim(true);
+      setTimeout(() => setOodaPhaseAnim(false), 300);
+    }, 1200);
+    return () => clearInterval(interval);
+  }, [gameState]);
+
+  const gameLoop = useCallback(() => {
+    if (gameState !== "playing") return;
+
+    // Update enemies
+    const spd = speedRef.current;
+    enemiesRef.current = enemiesRef.current
+      .map(e => ({ ...e, y: e.y + e.speed }))
+      .filter(e => e.y < TRACK_HEIGHT + CAR_H);
+
+    // Spawn
+    spawnTimer.current += 1;
+    if (spawnTimer.current > Math.max(40, 80 - levelRef.current * 5)) {
+      enemiesRef.current.push(spawnEnemy());
+      spawnTimer.current = 0;
+    }
+
+    // Score
+    scoreRef.current += 1;
+    if (scoreRef.current % 200 === 0) {
+      levelRef.current = Math.min(10, levelRef.current + 1);
+      speedRef.current = 3 + levelRef.current * 0.5;
+    }
+
+    // Smooth player X
+    const tX = playerLaneRef.current * LANE_W + LANE_W / 2 - CAR_W / 2;
+    playerXAnim.current = lerp(playerXAnim.current, tX, 0.18);
+
+    // Collision
+    const pX = playerXAnim.current;
+    const pY = playerY;
+    for (const e of enemiesRef.current) {
+      const eX = e.lane * LANE_W + LANE_W / 2 - CAR_W / 2;
+      if (
+        Math.abs(pX - eX) < CAR_W * 0.8 &&
+        Math.abs(pY - e.y) < CAR_H * 0.8
+      ) {
+        triggerExplosion(pX + CAR_W / 2, pY + CAR_H / 2);
+        setShake(true);
+        setTimeout(() => setShake(false), 500);
+        const finalScore = scoreRef.current;
+        if (finalScore > highScore) {
+          setHighScore(finalScore);
+          localStorage.setItem("ooda_hs", String(finalScore));
+        }
+        setScore(finalScore);
+        setLevel(levelRef.current);
+        setGameState("dead");
+        cancelAnimationFrame(frameRef.current);
+        return;
+      }
+    }
+
+    setEnemies([...enemiesRef.current]);
+    setScore(scoreRef.current);
+    setLevel(levelRef.current);
+    setDisplayX(playerXAnim.current);
+
+    frameRef.current = requestAnimationFrame(gameLoop);
+  }, [gameState, spawnEnemy, highScore, playerY]);
+
+  useEffect(() => {
+    if (gameState === "playing") {
+      frameRef.current = requestAnimationFrame(gameLoop);
+    }
+    return () => cancelAnimationFrame(frameRef.current);
+  }, [gameState, gameLoop]);
+
+  const startOODA = () => {
+    setOodaStep(0);
+    setGameState("ooda");
+  };
+
+  const nextOODA = () => {
+    if (oodaStep < 3) {
+      setOodaStep(s => s + 1);
+    } else {
+      // Start game
+      scoreRef.current = 0;
+      enemiesRef.current = [];
+      speedRef.current = 3;
+      levelRef.current = 1;
+      spawnTimer.current = 0;
+      playerXAnim.current = 1 * LANE_W + LANE_W / 2 - CAR_W / 2;
+      setPlayerLane(1);
+      setScore(0);
+      setLevel(1);
+      setSpeed(3);
+      setEnemies([]);
+      setExplosions([]);
+      setGameState("playing");
+    }
+  };
+
+  const handleLane = (dir) => {
+    if (gameState !== "playing") return;
+    setPlayerLane(prev => Math.max(0, Math.min(LANE_COUNT - 1, prev + dir)));
+  };
+
+  // Keyboard
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === "ArrowLeft") handleLane(-1);
+      if (e.key === "ArrowRight") handleLane(1);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [gameState]);
+
+  // Touch swipe
+  const touchX = useRef(null);
+  const handleTouchStart = (e) => { touchX.current = e.touches[0].clientX; };
+  const handleTouchEnd = (e) => {
+    if (touchX.current === null) return;
+    const dx = e.changedTouches[0].clientX - touchX.current;
+    if (Math.abs(dx) > 30) handleLane(dx > 0 ? 1 : -1);
+    touchX.current = null;
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: COLORS.bg,
+      display: "flex", flexDirection: "column", alignItems: "center",
+      justifyContent: "center", fontFamily: "'Courier New', monospace",
+      userSelect: "none", overflowX: "hidden",
+    }}>
+      <style>{`
+        @keyframes explode { 0%{transform:scale(0.5);opacity:1} 100%{transform:scale(2.5);opacity:0} }
+        @keyframes shake { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-8px)} 40%{transform:translateX(8px)} 60%{transform:translateX(-6px)} 80%{transform:translateX(6px)} }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        @keyframes slidein { from{opacity:0;transform:scale(0.7)} to{opacity:1;transform:scale(1)} }
+        @keyframes glow { 0%,100%{text-shadow:0 0 10px #e94560,0 0 20px #e94560} 50%{text-shadow:0 0 20px #ff6b6b,0 0 40px #ff6b6b,0 0 60px #ff6b6b} }
+        @keyframes stripe { 0%{transform:translateY(0)} 100%{transform:translateY(55px)} }
+        .ooda-btn:active{transform:scale(0.95)!important}
+      `}</style>
+
+      {/* MENU */}
+      {gameState === "menu" && (
+        <div style={{ textAlign: "center", animation: "fadeIn 0.5s ease" }}>
+          <div style={{ fontSize: 11, letterSpacing: 6, color: COLORS.accent, marginBottom: 8, textTransform: "uppercase" }}>
+            OODA LOOP
+          </div>
+          <div style={{
+            fontSize: 42, fontWeight: 900, color: "#fff",
+            animation: "glow 2s ease-in-out infinite",
+            letterSpacing: 2, marginBottom: 4,
+          }}>
+            DRAG RACE
+          </div>
+          <div style={{ fontSize: 13, color: "#888", marginBottom: 30 }}>Observe · Orient · Decide · Act</div>
+
+          {/* Preview car */}
+          <div style={{ marginBottom: 24, display: "flex", justifyContent: "center" }}>
+            <CarSVG color={COLORS.playerCar} glow={COLORS.playerGlow} />
+          </div>
+
+          <div style={{ display: "flex", gap: 12, marginBottom: 20, justifyContent: "center" }}>
+            {OODA_PHASES.map((p, i) => (
+              <div key={p} style={{
+                background: OODA_COLORS[i] + "22",
+                border: `1px solid ${OODA_COLORS[i]}`,
+                color: OODA_COLORS[i], borderRadius: 6,
+                padding: "4px 10px", fontSize: 11, fontWeight: 700,
+              }}>{p}</div>
+            ))}
+          </div>
+
+          <div style={{ color: "#aaa", fontSize: 12, marginBottom: 30, maxWidth: 280, lineHeight: 1.7 }}>
+            Dodge enemy cars using <b style={{ color: "#fff" }}>← → arrow keys</b> or <b style={{ color: "#fff" }}>swipe</b>.<br />
+            Apply OODA loop thinking to survive!
+          </div>
+
+          {highScore > 0 && (
+            <div style={{ color: COLORS.stripe, fontSize: 13, marginBottom: 16 }}>
+              🏆 Best: {highScore}
+            </div>
+          )}
+
+          <button className="ooda-btn" onClick={startOODA} style={{
+            background: "linear-gradient(135deg, #e94560, #c0392b)",
+            border: "none", color: "#fff", fontSize: 18,
+            fontWeight: 900, padding: "14px 48px", borderRadius: 12,
+            cursor: "pointer", letterSpacing: 2,
+            boxShadow: "0 0 20px #e94560aa",
+            transition: "transform 0.1s",
+          }}>
+            START
+          </button>
+        </div>
+      )}
+
+      {/* OODA BRIEFING */}
+      {gameState === "ooda" && (
+        <div style={{
+          width: 320, textAlign: "center", animation: "slidein 0.3s ease",
+          padding: "0 20px",
+        }}>
+          <div style={{ fontSize: 11, letterSpacing: 6, color: "#888", marginBottom: 20 }}>
+            MISSION BRIEF
+          </div>
+
+          {/* OODA steps */}
+          <div style={{ display: "flex", gap: 6, justifyContent: "center", marginBottom: 30 }}>
+            {OODA_PHASES.map((p, i) => (
+              <div key={p} style={{
+                flex: 1, padding: "8px 4px", borderRadius: 8, fontSize: 11,
+                fontWeight: 700, transition: "all 0.3s",
+                background: i === oodaStep ? OODA_COLORS[i] + "33" : "#ffffff08",
+                border: `1.5px solid ${i === oodaStep ? OODA_COLORS[i] : "#333"}`,
+                color: i === oodaStep ? OODA_COLORS[i] : "#555",
+                transform: i === oodaStep ? "scale(1.08)" : "scale(1)",
+              }}>
+                {p}
+              </div>
+            ))}
+          </div>
+
+          <div style={{
+            background: OODA_COLORS[oodaStep] + "18",
+            border: `1px solid ${OODA_COLORS[oodaStep]}44`,
+            borderRadius: 16, padding: "28px 24px", marginBottom: 24,
+            animation: "fadeIn 0.3s ease",
+          }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>
+              {["👁", "🧭", "🎯", "⚡"][oodaStep]}
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 900, color: OODA_COLORS[oodaStep], marginBottom: 10 }}>
+              {OODA_PHASES[oodaStep]}
+            </div>
+            <div style={{ fontSize: 13, color: "#ccc", lineHeight: 1.7 }}>
+              {[
+                "Watch all 4 lanes. Track where enemy cars are and predict their movement.",
+                "Understand the danger. Which lanes are blocked? Which gaps are safe?",
+                "Choose your lane before you need it — not when it's too late.",
+                "Move swiftly and decisively. Hesitation = collision."
+              ][oodaStep]}
+            </div>
+          </div>
+
+          <button className="ooda-btn" onClick={nextOODA} style={{
+            background: `linear-gradient(135deg, ${OODA_COLORS[oodaStep]}, ${OODA_COLORS[(oodaStep + 1) % 4]})`,
+            border: "none", color: "#000", fontSize: 15,
+            fontWeight: 900, padding: "14px 40px", borderRadius: 12,
+            cursor: "pointer", letterSpacing: 2,
+            boxShadow: `0 0 16px ${OODA_COLORS[oodaStep]}88`,
+            transition: "transform 0.1s", width: "100%",
+          }}>
+            {oodaStep < 3 ? `NEXT: ${OODA_PHASES[oodaStep + 1]} →` : "⚡ RACE!"}
+          </button>
+
+          <div style={{ marginTop: 16, fontSize: 11, color: "#555" }}>
+            Step {oodaStep + 1} of 4
+          </div>
+        </div>
+      )}
+
+      {/* GAME */}
+      {(gameState === "playing" || gameState === "dead") && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+          {/* HUD */}
+          <div style={{
+            width: TRACK_WIDTH, display: "flex", justifyContent: "space-between",
+            alignItems: "center", padding: "8px 12px",
+            background: COLORS.hud, borderRadius: "12px 12px 0 0",
+            borderBottom: `1px solid #333`,
+          }}>
+            <div>
+              <div style={{ fontSize: 10, color: "#888" }}>SCORE</div>
+              <div style={{ fontSize: 20, fontWeight: 900, color: "#fff" }}>{score}</div>
+            </div>
+            <div style={{ textAlign: "center" }}>
+              <div style={{
+                fontSize: 13, fontWeight: 700,
+                color: OODA_COLORS[currentOoda],
+                animation: oodaPhaseAnim ? "slidein 0.2s ease" : "none",
+                letterSpacing: 2,
+              }}>
+                {OODA_PHASES[currentOoda]}
+              </div>
+              <div style={{ fontSize: 10, color: "#666" }}>{OODA_DESC[currentOoda].split(" ")[0]}</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 10, color: "#888" }}>LEVEL</div>
+              <div style={{ fontSize: 20, fontWeight: 900, color: COLORS.stripe }}>{level}</div>
+            </div>
+          </div>
+
+          {/* Track */}
+          <div
+            onTouchStart={handleTouchStart}
+            onTouchEnd={handleTouchEnd}
+            style={{
+              width: TRACK_WIDTH, height: TRACK_HEIGHT,
+              background: COLORS.track, position: "relative",
+              overflow: "hidden", borderRadius: "0 0 12px 12px",
+              animation: shake ? "shake 0.5s ease" : "none",
+              cursor: "pointer",
+            }}
+          >
+            {/* Road lanes bg */}
+            {Array.from({ length: LANE_COUNT }).map((_, i) => (
+              <div key={i} style={{
+                position: "absolute", top: 0, bottom: 0,
+                left: i * LANE_W, width: LANE_W,
+                background: i % 2 === 0 ? "#181825" : "#1e1e2e",
+              }} />
+            ))}
+
+            {/* Lane dividers */}
+            {Array.from({ length: LANE_COUNT - 1 }).map((_, i) => (
+              <div key={i} style={{
+                position: "absolute", top: 0, bottom: 0,
+                left: (i + 1) * LANE_W - 1, width: 2,
+                background: "#2a2a3e",
+              }} />
+            ))}
+
+            {/* Road stripes */}
+            {stripes.map((s, i) => (
+              <div key={i} style={{
+                position: "absolute",
+                left: (s.lane + 0.5) * LANE_W - 2,
+                top: s.y,
+                width: 4, height: 24,
+                background: "#ffffff18",
+                borderRadius: 2,
+                animation: `stripe ${Math.max(0.5, 1.5 / speed)}s linear infinite`,
+              }} />
+            ))}
+
+            {/* Enemy cars */}
+            {enemies.map(e => (
+              <div key={e.id} style={{
+                position: "absolute",
+                left: e.lane * LANE_W + LANE_W / 2 - CAR_W / 2,
+                top: e.y,
+                transition: "none",
+              }}>
+                <CarSVG color={COLORS.enemyCar[e.colorIdx]} glow={COLORS.enemyGlow[e.colorIdx]} flipped />
+              </div>
+            ))}
+
+            {/* Player car */}
+            {gameState === "playing" && (
+              <div style={{
+                position: "absolute",
+                left: displayX,
+                top: playerY,
+                transition: "none",
+                zIndex: 10,
+              }}>
+                <CarSVG color={COLORS.playerCar} glow={COLORS.playerGlow} />
+                {/* Exhaust */}
+                <div style={{
+                  position: "absolute", bottom: -8, left: "50%",
+                  transform: "translateX(-50%)",
+                  width: 8, height: 16,
+                  background: "linear-gradient(to bottom, #ffb86c88, transparent)",
+                  borderRadius: "0 0 8px 8px",
+                  animation: "pulse 0.3s ease-in-out infinite",
+                }} />
+              </div>
+            )}
+
+            {/* Explosions */}
+            {explosions.map(ex => <Explosion key={ex.id} x={ex.x} y={ex.y} />)}
+
+            {/* OODA overlay during play */}
+            {gameState === "playing" && (
+              <div sty  le={{
+                position: "absolute", top: 8, left: 0, right: 0,
+                display: "flex", justifyContent: "center", gap: 4, pointerEvents: "none",
+              }}>
+                {OODA_PHASES.map((p, i) => (
+                  <div key={p} style={{
+                    padding: "3px 7px", borderRadius: 4, fontSize: 9, fontWeight: 700,
+                    background: i === currentOoda ? OODA_COLORS[i] + "cc" : "rgba(0,0,0,0.4)",
+                    color: i === currentOoda ? "#000" : "#444",
+                    transition: "all 0.3s",
+                    transform: i === currentOoda ? "scale(1.1)" : "scale(1)",
+                  }}>{p}</div>
+                ))}
+              </div>
+            )}
+
+            {/* Dead overlay */}
+            {gameState === "dead" && (
+              <div style={{
+                position: "absolute", inset: 0,
+                background: "rgba(0,0,0,0.85)",
+                display: "flex", flexDirection: "column",
+                alignItem
